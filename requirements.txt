@@ -1,0 +1,5 @@
+streamlit
+PyPDF2
+pptx
+google-generativeai
+pdfplumber
