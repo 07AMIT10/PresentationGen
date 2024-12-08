@@ -1,6 +1,6 @@
 streamlit
 PyPDF2
-pptx
+python-pptx
 google-generativeai
 pdfplumber
 tiktoken
