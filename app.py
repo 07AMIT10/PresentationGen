@@ -101,10 +101,7 @@ def call_gemini_api_for_slides(source_text, topic, num_slides):
     {source_text}
     """
 
-    # Initialize Gemini 1.5 Flash
     model = genai.GenerativeModel('gemini-1.5-pro')
-    
-    # Generate response
     response = model.generate_content(
         prompt,
         generation_config={
@@ -115,72 +112,21 @@ def call_gemini_api_for_slides(source_text, topic, num_slides):
         }
     )
 
-    # Extract content
+    # Clean the response text
     content = response.text.strip()
+    
+    # Remove Markdown code blocks if present
+    if content.startswith("```") and content.endswith("```"):
+        # Extract content between code blocks
+        content = content.split("```")[1]
+        # Remove language identifier if present (e.g., 'json')
+        if content.startswith("json\n"):
+            content = content[5:]
+        content = content.strip()
 
     try:
         slides_data = json.loads(content)
     except json.JSONDecodeError:
-        raise ValueError("The model did not return valid JSON. Response was: " + content)
+        raise ValueError(f"The model did not return valid JSON. Response was: {content}")
+    
     return slides_data
-
-def create_ppt_from_slides(slides_data, template_ppt):
-    prs = Presentation(template_ppt)
-
-    # Use a generic "Title and Content" layout. 
-    # Adjust layout index if needed based on your template structure.
-    # Commonly:
-    # 0: Title Slide
-    # 1: Title and Content
-    # ...
-    slide_layout = prs.slide_layouts[1]
-
-    for slide_info in slides_data["slides"]:
-        slide = prs.slides.add_slide(slide_layout)
-        title_placeholder = slide.shapes.title
-        body_placeholder = slide.placeholders[1]
-
-        title_placeholder.text = slide_info["title"]
-        
-        body_tf = body_placeholder.text_frame
-        body_tf.text = ""  # Clear any default text
-        for bullet in slide_info["bullets"]:
-            p = body_tf.add_paragraph()
-            p.text = bullet
-            p.level = 0  # top-level bullet
-
-    output_stream = BytesIO()
-    prs.save(output_stream)
-    output_stream.seek(0)
-    return output_stream
-
-# Update main processing logic
-if generate_button and uploaded_files and topic:
-    with st.spinner("Processing PDFs..."):
-        source_text, total_tokens, processed_files = process_pdfs(uploaded_files)
-        
-        if total_tokens == 0:
-            st.error("No content could be processed. Please check file sizes.")
-        else:
-            slides_data = call_gemini_api_for_slides(source_text, topic, num_slides)
-
-            # Determine which template to use:
-            if uploaded_template is not None:
-                template_bytes = uploaded_template.read()
-                template_ppt = BytesIO(template_bytes)
-            else:
-                # Use default template from file
-                with open("template.pptx", "rb") as f:
-                    template_ppt = BytesIO(f.read())
-
-            ppt_file = create_ppt_from_slides(slides_data, template_ppt)
-
-    st.success("Slides generated successfully!")
-    st.download_button(
-        label="Download PPT",
-        data=ppt_file,
-        file_name="generated_presentation.pptx",
-        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
-    )
-elif generate_button and not uploaded_files:
-    st.error("Please upload a PDF first.")
