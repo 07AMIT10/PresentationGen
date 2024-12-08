@@ -1,5 +1,3 @@
-
-
 import os
 import streamlit as st
 import PyPDF2
@@ -8,15 +6,35 @@ from pptx import Presentation
 from io import BytesIO
 import google.generativeai as genai
 import json
+import tiktoken  # Add to requirements.txt
 
 # Set your Gemini API Key.
 # If not set in environment variables, replace "YOUR_GEMINI_API_KEY" with actual key.
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
+# Add these constants at the top
+MAX_TOKENS = 1900000  # Leave buffer from 2M limit
+TOKENS_PER_PAGE_ESTIMATE = 1500  # Average estimate
+MAX_PAGES_TOTAL = MAX_TOKENS // TOKENS_PER_PAGE_ESTIMATE
+
+# Update Streamlit UI
 st.title("AI-Powered PPT Generator with Custom Theme")
 
-uploaded_file = st.file_uploader("Upload a PDF (source content)", type=["pdf"])
+st.markdown("""
+### Guidelines for PDF Upload:
+- Maximum combined length: ~1,250 pages
+- For larger books: Upload specific chapters
+- Large PDFs (>500 pages): Upload alone
+- Multiple smaller PDFs: Combined if under limit
+- System shows token count and skips if exceeded
+""")
+
+# Multiple file uploader
+uploaded_files = st.file_uploader("Upload PDF(s) (Max ~1250 pages total)", 
+                                type=["pdf"], 
+                                accept_multiple_files=True)
+
 uploaded_template = st.file_uploader("Upload a PPTX template (optional)", type=["pptx"])
 topic = st.text_input("Enter the topic for the slides:")
 num_slides = st.number_input("Number of slides:", min_value=1, max_value=50, value=10)
@@ -30,6 +48,34 @@ def extract_text_from_pdf(pdf_bytes):
             if text:
                 all_text += text + "\n"
     return all_text
+
+def count_tokens(text):
+    encoding = tiktoken.get_encoding("cl100k_base")
+    return len(encoding.encode(text))
+
+def process_pdfs(uploaded_files):
+    combined_text = ""
+    total_tokens = 0
+    processed_files = []
+    
+    for file in uploaded_files:
+        pdf_bytes = file.read()
+        text = extract_text_from_pdf(BytesIO(pdf_bytes))
+        tokens = count_tokens(text)
+        
+        # Check if adding this file would exceed token limit
+        if total_tokens + tokens > MAX_TOKENS:
+            st.warning(f"Skipping {file.name} as it would exceed the token limit. Current total: {total_tokens:,} tokens")
+            continue
+            
+        combined_text += f"\n\nSource: {file.name}\n{text}"
+        total_tokens += tokens
+        processed_files.append(file.name)
+        
+        st.info(f"Processed {file.name}: {tokens:,} tokens")
+    
+    st.write(f"Total tokens processed: {total_tokens:,}")
+    return combined_text, total_tokens, processed_files
 
 def call_gemini_api_for_slides(source_text, topic, num_slides):
     prompt = f"""
@@ -55,14 +101,22 @@ def call_gemini_api_for_slides(source_text, topic, num_slides):
     {source_text}
     """
 
-    response = genai.generate_text(
-        model="chat-bison-001",
-        prompt=prompt,
-        temperature=0.2,
-        max_output_tokens=1024
+    # Initialize Gemini 1.5 Flash
+    model = genai.GenerativeModel('gemini-1.5-pro')
+    
+    # Generate response
+    response = model.generate_content(
+        prompt,
+        generation_config={
+            "temperature": 0.2,
+            "top_p": 1,
+            "top_k": 32,
+            "max_output_tokens": 2048,
+        }
     )
 
-    content = response.generations[0].text.strip()
+    # Extract content
+    content = response.text.strip()
 
     try:
         slides_data = json.loads(content)
@@ -100,27 +154,26 @@ def create_ppt_from_slides(slides_data, template_ppt):
     output_stream.seek(0)
     return output_stream
 
-if generate_button and uploaded_file and topic:
-    with st.spinner("Processing..."):
-        pdf_bytes = uploaded_file.read()
-        source_text = extract_text_from_pdf(BytesIO(pdf_bytes))
+# Update main processing logic
+if generate_button and uploaded_files and topic:
+    with st.spinner("Processing PDFs..."):
+        source_text, total_tokens, processed_files = process_pdfs(uploaded_files)
         
-        # Truncate source if too large. Better: summarize if needed.
-        if len(source_text) > 15000:
-            source_text = source_text[:15000]
-
-        slides_data = call_gemini_api_for_slides(source_text, topic, num_slides)
-
-        # Determine which template to use:
-        if uploaded_template is not None:
-            template_bytes = uploaded_template.read()
-            template_ppt = BytesIO(template_bytes)
+        if total_tokens == 0:
+            st.error("No content could be processed. Please check file sizes.")
         else:
-            # Use default template from file
-            with open("template.pptx", "rb") as f:
-                template_ppt = BytesIO(f.read())
+            slides_data = call_gemini_api_for_slides(source_text, topic, num_slides)
 
-        ppt_file = create_ppt_from_slides(slides_data, template_ppt)
+            # Determine which template to use:
+            if uploaded_template is not None:
+                template_bytes = uploaded_template.read()
+                template_ppt = BytesIO(template_bytes)
+            else:
+                # Use default template from file
+                with open("template.pptx", "rb") as f:
+                    template_ppt = BytesIO(f.read())
+
+            ppt_file = create_ppt_from_slides(slides_data, template_ppt)
 
     st.success("Slides generated successfully!")
     st.download_button(
@@ -129,5 +182,5 @@ if generate_button and uploaded_file and topic:
         file_name="generated_presentation.pptx",
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
     )
-elif generate_button and not uploaded_file:
+elif generate_button and not uploaded_files:
     st.error("Please upload a PDF first.")
