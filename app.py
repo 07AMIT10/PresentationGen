@@ -1,26 +1,23 @@
 import os
 import streamlit as st
-import PyPDF2
 import pdfplumber
 from pptx import Presentation
 from io import BytesIO
 import google.generativeai as genai
 import json
-import tiktoken  # Add to requirements.txt
+import tiktoken
 
-# Set your Gemini API Key.
-# If not set in environment variables, replace "YOUR_GEMINI_API_KEY" with actual key.
+# Constants
+MAX_TOKENS = 1900000
+TOKENS_PER_PAGE_ESTIMATE = 1500
+MAX_PAGES_TOTAL = MAX_TOKENS // TOKENS_PER_PAGE_ESTIMATE
+
+# Configure Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
-# Add these constants at the top
-MAX_TOKENS = 1900000  # Leave buffer from 2M limit
-TOKENS_PER_PAGE_ESTIMATE = 1500  # Average estimate
-MAX_PAGES_TOTAL = MAX_TOKENS // TOKENS_PER_PAGE_ESTIMATE
-
-# Update Streamlit UI
+# UI Setup
 st.title("AI-Powered PPT Generator with Custom Theme")
-
 st.markdown("""
 ### Guidelines for PDF Upload:
 - Maximum combined length: ~1,250 pages
@@ -29,16 +26,6 @@ st.markdown("""
 - Multiple smaller PDFs: Combined if under limit
 - System shows token count and skips if exceeded
 """)
-
-# Multiple file uploader
-uploaded_files = st.file_uploader("Upload PDF(s) (Max ~1250 pages total)", 
-                                type=["pdf"], 
-                                accept_multiple_files=True)
-
-uploaded_template = st.file_uploader("Upload a PPTX template (optional)", type=["pptx"])
-topic = st.text_input("Enter the topic for the slides:")
-num_slides = st.number_input("Number of slides:", min_value=1, max_value=50, value=10)
-generate_button = st.button("Generate PPT")
 
 def extract_text_from_pdf(pdf_bytes):
     all_text = ""
@@ -59,74 +46,121 @@ def process_pdfs(uploaded_files):
     processed_files = []
     
     for file in uploaded_files:
+        st.info(f"Processing {file.name}...")
         pdf_bytes = file.read()
         text = extract_text_from_pdf(BytesIO(pdf_bytes))
         tokens = count_tokens(text)
         
-        # Check if adding this file would exceed token limit
         if total_tokens + tokens > MAX_TOKENS:
-            st.warning(f"Skipping {file.name} as it would exceed the token limit. Current total: {total_tokens:,} tokens")
+            st.warning(f"Skipping {file.name} - would exceed token limit. Current: {total_tokens:,}")
             continue
             
         combined_text += f"\n\nSource: {file.name}\n{text}"
         total_tokens += tokens
         processed_files.append(file.name)
-        
-        st.info(f"Processed {file.name}: {tokens:,} tokens")
+        st.success(f"Processed {file.name}: {tokens:,} tokens")
     
     st.write(f"Total tokens processed: {total_tokens:,}")
     return combined_text, total_tokens, processed_files
 
 def call_gemini_api_for_slides(source_text, topic, num_slides):
     prompt = f"""
-    You are an assistant that creates PowerPoint slide outlines from provided source text. 
-    The user wants a presentation on the topic "{topic}" with exactly {num_slides} slides.
-    For each slide, provide:
-    - A short, compelling slide title (no more than 8 words)
-    - 3-5 bullet points of text
-    
-    Make sure the slides flow logically and cover key points from the provided text. 
-    Output ONLY in JSON format like:
+    Create a {num_slides}-slide presentation about "{topic}".
+    For each slide provide:
+    - Short title (max 8 words)
+    - 3-5 bullet points
+    Output as JSON only:
     {{
       "slides": [
         {{
-          "title": "Slide Title 1",
+          "title": "Title",
           "bullets": ["Point 1", "Point 2", "Point 3"]
-        }},
-        ...
+        }}
       ]
     }}
-
-    Source Text:
-    {source_text}
-    """
-
-    model = genai.GenerativeModel('gemini-1.5-pro')
-    response = model.generate_content(
-        prompt,
-        generation_config={
-            "temperature": 0.2,
-            "top_p": 1,
-            "top_k": 32,
-            "max_output_tokens": 2048,
-        }
-    )
-
-    # Clean the response text
-    content = response.text.strip()
+    Source text: {source_text}"""
     
-    # Remove Markdown code blocks if present
-    if content.startswith("```") and content.endswith("```"):
-        # Extract content between code blocks
-        content = content.split("```")[1]
-        # Remove language identifier if present (e.g., 'json')
-        if content.startswith("json\n"):
-            content = content[5:]
-        content = content.strip()
-
     try:
-        slides_data = json.loads(content)
-    except json.JSONDecodeError:
-        raise ValueError(f"The model did not return valid JSON. Response was: {content}")
+        model = genai.GenerativeModel('gemini-1.5-pro')
+        response = model.generate_content(
+            prompt,
+            generation_config={
+                "temperature": 0.2,
+                "top_p": 1,
+                "top_k": 32,
+                "max_output_tokens": 2048,
+            }
+        )
+        
+        content = response.text.strip()
+        if content.startswith("```") and content.endswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json\n"):
+                content = content[5:]
+            content = content.strip()
+            
+        return json.loads(content)
+    except Exception as e:
+        st.error(f"API Error: {str(e)}")
+        raise
+
+def create_ppt_from_slides(slides_data, template_ppt):
+    prs = Presentation(template_ppt)
+    slide_layout = prs.slide_layouts[1]  # Title and Content layout
     
-    return slides_data
+    for slide_info in slides_data["slides"]:
+        slide = prs.slides.add_slide(slide_layout)
+        slide.shapes.title.text = slide_info["title"]
+        
+        body_shape = slide.shapes.placeholders[1]
+        tf = body_shape.text_frame
+        tf.text = ""  # Clear default
+        
+        for bullet in slide_info["bullets"]:
+            p = tf.add_paragraph()
+            p.text = bullet
+            p.level = 0
+    
+    pptx_stream = BytesIO()
+    prs.save(pptx_stream)
+    pptx_stream.seek(0)
+    return pptx_stream
+
+# UI Inputs
+uploaded_files = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
+uploaded_template = st.file_uploader("Upload PPT template (optional)", type=["pptx"])
+topic = st.text_input("Presentation topic:")
+num_slides = st.number_input("Number of slides:", 1, 50, 10)
+generate_button = st.button("Generate PPT")
+
+# Main execution
+if generate_button:
+    if not uploaded_files:
+        st.error("Please upload at least one PDF")
+    elif not topic:
+        st.error("Please enter a topic")
+    else:
+        try:
+            with st.spinner("Processing..."):
+                st.info("Step 1: Processing PDFs...")
+                source_text, total_tokens, processed_files = process_pdfs(uploaded_files)
+                
+                if total_tokens == 0:
+                    st.error("No content could be processed")
+                else:
+                    st.info("Step 2: Generating slides content...")
+                    slides_data = call_gemini_api_for_slides(source_text, topic, num_slides)
+                    
+                    st.info("Step 3: Creating PowerPoint...")
+                    template_ppt = BytesIO(uploaded_template.read()) if uploaded_template else BytesIO(open("template.pptx", "rb").read())
+                    ppt_file = create_ppt_from_slides(slides_data, template_ppt)
+                    
+                    st.success("✅ Presentation generated!")
+                    st.download_button(
+                        "⬇️ Download PPT",
+                        ppt_file,
+                        file_name="presentation.pptx",
+                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                    )
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
