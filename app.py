@@ -78,7 +78,8 @@ def call_gemini_api_for_slides(source_text, topic, num_slides):
         }}
       ]
     }}
-    Source text: {source_text}"""
+    Source text: {source_text}
+    """
     
     try:
         model = genai.GenerativeModel('gemini-1.5-pro')
@@ -152,7 +153,17 @@ if generate_button:
                     slides_data = call_gemini_api_for_slides(source_text, topic, num_slides)
                     
                     st.info("Step 3: Creating PowerPoint...")
-                    template_ppt = BytesIO(uploaded_template.read()) if uploaded_template else BytesIO(open("template.pptx", "rb").read())
+                    if uploaded_template:
+                        template_bytes = uploaded_template.getvalue()
+                        template_ppt = BytesIO(template_bytes)
+                    else:
+                        try:
+                            with open("template.pptx", "rb") as f:
+                                template_ppt = BytesIO(f.read())
+                        except FileNotFoundError:
+                            st.error("Default template.pptx not found in application directory")
+                            raise
+
                     ppt_file = create_ppt_from_slides(slides_data, template_ppt)
                     
                     st.success("✅ Presentation generated!")
