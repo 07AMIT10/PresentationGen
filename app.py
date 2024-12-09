@@ -153,17 +153,36 @@ if generate_button:
                     slides_data = call_gemini_api_for_slides(source_text, topic, num_slides)
                     
                     st.info("Step 3: Creating PowerPoint...")
-                    if uploaded_template:
-                        template_bytes = uploaded_template.getvalue()
-                        template_ppt = BytesIO(template_bytes)
-                    else:
-                        try:
-                            with open("template.pptx", "rb") as f:
-                                template_ppt = BytesIO(f.read())
-                        except FileNotFoundError:
-                            st.error("Default template.pptx not found in application directory")
-                            raise
-
+                    try:
+                        # Check if the user uploaded a template
+                        if uploaded_template:
+                            st.info("Using uploaded PPT template...")
+                            template_bytes = uploaded_template.getvalue()
+                            template_ppt = BytesIO(template_bytes)
+                            
+                            # Validate template
+                            try:
+                                Presentation(template_ppt)  # Test if it's a valid .pptx file
+                            except Exception:
+                                raise ValueError("Uploaded template is not a valid PowerPoint file.")
+                        else:
+                            # Use default template
+                            st.info("Using default PPT template...")
+                            try:
+                                with open("template.pptx", "rb") as f:
+                                    template_bytes = f.read()
+                                    template_ppt = BytesIO(template_bytes)
+                                    
+                                    # Validate template
+                                    Presentation(template_ppt)  # Test if it's a valid .pptx file
+                            except FileNotFoundError:
+                                raise FileNotFoundError("Default template.pptx not found in the application directory.")
+                            except Exception:
+                                raise ValueError("Default template.pptx is not a valid PowerPoint file.")
+                    except Exception as e:
+                        st.error(f"Template Error: {str(e)}")
+                        raise
+                    
                     ppt_file = create_ppt_from_slides(slides_data, template_ppt)
                     
                     st.success("✅ Presentation generated!")
