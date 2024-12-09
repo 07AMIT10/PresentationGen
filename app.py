@@ -4,21 +4,17 @@ import streamlit as st
 import pdfplumber
 from pptx import Presentation
 from pptx.util import Pt, Inches
-from pptx.enum.text import PP_ALIGN
 from pptx.dml.color import RGBColor
-from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.enum.dml import MSO_THEME_COLOR
-from pptx.enum.action import PP_ACTION
 from io import BytesIO
 import google.generativeai as genai
 import json
 import tiktoken
 from pathlib import Path
 
-# Create default template if not exists
+# Create a default template if not exists
 def create_default_template():
     if not Path("template.pptx").exists():
-        # Just create a blank presentation and rely on its default layouts
+        # Create a simple blank presentation and rely on its default layouts:
         prs = Presentation()
         prs.save("template.pptx")
 
@@ -27,11 +23,18 @@ MAX_TOKENS = 1900000
 TOKENS_PER_PAGE_ESTIMATE = 1500
 MAX_PAGES_TOTAL = MAX_TOKENS // TOKENS_PER_PAGE_ESTIMATE
 
+# Mapping standard pptx layouts to our named layouts
+# Assuming a standard template:
+# 0: Title Slide
+# 1: Title and Content
+# 2: Section Header
+# 3: Two Content
+# 4: Comparison
 SLIDE_LAYOUTS = {
     "Title Slide": {"id": 0, "placeholders": ["title", "subtitle"]},
     "Content": {"id": 1, "placeholders": ["title", "content"]},
-    "Two Content": {"id": 2, "placeholders": ["title", "left_content", "right_content"]},
-    "Section Header": {"id": 2, "placeholders": ["title"]},  # Adjust as needed if Section Header differs
+    "Two Content": {"id": 3, "placeholders": ["title", "left_content", "right_content"]},
+    "Section Header": {"id": 2, "placeholders": ["title", "subtitle"]},
     "Comparison": {"id": 4, "placeholders": ["title", "table"]},
 }
 
@@ -99,44 +102,48 @@ def process_pdfs(uploaded_files):
     return combined_text, total_tokens, processed_files
 
 def call_gemini_api_for_slides(source_text, topic, num_slides, selected_layout):
+    # Updated prompt to be very explicit about structure:
     prompt = f"""
-    Create a {num_slides}-slide presentation about "{topic}" using {selected_layout} layout.
-    
-    For each slide provide:
-    1. title: Short, compelling title (max 8 words)
-    2. layout_type: One of {list(SLIDE_LAYOUTS.keys())}
-    3. content:
-       - For Title Slide: subtitle text
-       - For Content: 3-5 bullet points (key points)
-       - For Two Content: left and right bullet points (3-5 each)
-       - For Section Header: a subtitle line
-       - For Comparison: comparison points in table format (use bullets or short lines)
-    4. transition: slide transition effect
-    
-    Output as JSON:
+Create a {num_slides}-slide presentation about "{topic}".
+
+For each slide, return a JSON object with:
+- title (string, short)
+- layout_type (one of {list(SLIDE_LAYOUTS.keys())})
+- content (an object depending on layout_type):
+  For "Title Slide": {{"subtitle": "Your subtitle here"}}
+  For "Content": {{"bullets": ["bullet1", "bullet2", ...]}}
+  For "Two Content": {{"left": ["bullet1","bullet2"], "right":["bullet1","bullet2"]}}
+  For "Section Header": {{"subtitle": "Your subtitle here"}}
+  For "Comparison": {{"comparison_points": ["point1","point2",...]}}
+- transition: one of {TRANSITIONS}
+
+Make sure the output is valid JSON. For example:
+{{
+  "slides": [
     {{
-      "slides": [
-        {{
-          "title": "Title",
-          "layout_type": "Content",
-          "content": {{}},
-          "transition": "None"
-        }}
-      ]
+      "title": "Introduction",
+      "layout_type": "Content",
+      "content": {{
+        "bullets": ["First point", "Second point"]
+      }},
+      "transition": "None"
     }}
-    """
+  ]
+}}
+"""
+
     try:
         model = genai.GenerativeModel('gemini-1.5-pro')
         response = model.generate_content(prompt)
         content = response.text.strip()
         
-        # Clean JSON response if it's wrapped in triple backticks
+        # Clean JSON response if wrapped in backticks
         if content.startswith("```") and content.endswith("```"):
             content = content.split("```")[1]
             if content.startswith("json\n"):
                 content = content[5:]
             content = content.strip()
-        
+
         return json.loads(content)
     except Exception as e:
         st.error(f"API Error: {str(e)}")
@@ -163,7 +170,7 @@ def apply_theme(slide, theme, layout_type):
                 paragraph.font.size = Pt(18)
                 paragraph.font.color.rgb = RGBColor(*secondary_rgb)
     
-    # Add footer
+    # Add footer if provided
     if theme.get("footer_text"):
         left = Inches(0.5)
         top = slide.height - Inches(0.5)
@@ -182,17 +189,19 @@ def create_enhanced_ppt(slides_data, template_ppt, theme, num_slides):
         layout_idx = SLIDE_LAYOUTS[layout_type]["id"]
         slide = prs.slides.add_slide(prs.slide_layouts[layout_idx])
         
-        # Apply content
-        slide.shapes.title.text = slide_info["title"]
+        # Set the title (if there is a placeholder)
+        if slide.shapes.title:
+            slide.shapes.title.text = slide_info["title"]
         
-        # Handle each layout type
+        # Populate slide content depending on layout
         if layout_type == "Title Slide":
-            # subtitle
+            # Expecting "subtitle" in content
             if len(slide.placeholders) > 1:
-                slide.placeholders[1].text = slide_info["content"].get("subtitle", "")
+                subtitle = slide_info["content"].get("subtitle", "")
+                slide.placeholders[1].text = subtitle
         
         elif layout_type == "Content":
-            # content bullets
+            # Expecting "bullets" in content
             if len(slide.placeholders) > 1:
                 body_shape = slide.placeholders[1]
                 tf = body_shape.text_frame
@@ -203,32 +212,40 @@ def create_enhanced_ppt(slides_data, template_ppt, theme, num_slides):
                     p.level = 0
         
         elif layout_type == "Two Content":
-            # two-column bullets
-            # Assume placeholders[1] and [2] exist
+            # Expecting "left" and "right" arrays
             if len(slide.placeholders) > 2:
                 left_shape = slide.placeholders[1]
                 right_shape = slide.placeholders[2]
                 
-                for shape, content in [(left_shape, slide_info["content"].get("left", [])),
-                                       (right_shape, slide_info["content"].get("right", []))]:
-                    tf = shape.text_frame
-                    tf.text = ""
-                    for bullet in content:
-                        p = tf.add_paragraph()
-                        p.text = bullet
-                        p.level = 0
+                left_bullets = slide_info["content"].get("left", [])
+                right_bullets = slide_info["content"].get("right", [])
+                
+                # Left column
+                left_tf = left_shape.text_frame
+                left_tf.text = ""
+                for bullet in left_bullets:
+                    p = left_tf.add_paragraph()
+                    p.text = bullet
+                    p.level = 0
+                
+                # Right column
+                right_tf = right_shape.text_frame
+                right_tf.text = ""
+                for bullet in right_bullets:
+                    p = right_tf.add_paragraph()
+                    p.text = bullet
+                    p.level = 0
         
         elif layout_type == "Section Header":
-            # a subtitle in a single placeholder if available
-            if len(slide.placeholders) > 0:
-                # Since it's usually just a title placeholder for Section Header
-                # If there's another placeholder, use it for subtitle if given
-                # (Adjust as needed if actual template differs)
-                pass  # If there's a second placeholder for subtitle, handle similarly
+            # Expecting "subtitle"
+            # Usually Section Header layouts have one title placeholder, maybe a subtitle placeholder
+            # If there's a second placeholder, use it:
+            if len(slide.placeholders) > 1:
+                subtitle = slide_info["content"].get("subtitle", "")
+                slide.placeholders[1].text = subtitle
         
         elif layout_type == "Comparison":
-            # table or bullets comparing points
-            # If layout has placeholders, insert comparison bullets or lines
+            # Expecting "comparison_points" in content
             if len(slide.placeholders) > 1:
                 body_shape = slide.placeholders[1]
                 tf = body_shape.text_frame
