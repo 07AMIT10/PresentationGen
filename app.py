@@ -1,33 +1,68 @@
+```python
+# app.py
 import os
 import streamlit as st
 import pdfplumber
 from pptx import Presentation
-from pptx.util import Pt
+from pptx.util import Pt, Inches
+from pptx.enum.text import PP_ALIGN
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.dml import MSO_THEME_COLOR
+from pptx.enum.action import PP_ACTION
 from io import BytesIO
 import google.generativeai as genai
 import json
 import tiktoken
+from pathlib import Path
+
+# Create default template if not exists
+def create_default_template():
+    if not Path("template.pptx").exists():
+        prs = Presentation()
+        # Add layouts
+        prs.slide_layouts.add_slide("Title Slide", MSO_THEME_COLOR.ACCENT_1)
+        prs.slide_layouts.add_slide("Content", MSO_THEME_COLOR.ACCENT_2)
+        prs.slide_layouts.add_slide("Two Content", MSO_THEME_COLOR.ACCENT_3)
+        prs.slide_layouts.add_slide("Comparison", MSO_THEME_COLOR.ACCENT_4)
+        prs.save("template.pptx")
 
 # Constants
 MAX_TOKENS = 1900000
 TOKENS_PER_PAGE_ESTIMATE = 1500
 MAX_PAGES_TOTAL = MAX_TOKENS // TOKENS_PER_PAGE_ESTIMATE
 
-# Configure Gemini
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
+SLIDE_LAYOUTS = {
+    "Title Slide": {"id": 0, "placeholders": ["title", "subtitle"]},
+    "Content": {"id": 1, "placeholders": ["title", "content"]},
+    "Two Content": {"id": 2, "placeholders": ["title", "left_content", "right_content"]},
+    "Section Header": {"id": 3, "placeholders": ["title"]},
+    "Comparison": {"id": 4, "placeholders": ["title", "table"]},
+}
 
-# UI Setup
-st.title("AI-Powered PPT Generator with Custom Theme")
-st.markdown("""
-### Guidelines for PDF Upload:
-- Maximum combined length: ~1,250 pages
-- For larger books: Upload specific chapters
-- Large PDFs (>500 pages): Upload alone
-- Multiple smaller PDFs: Combined if under limit
-- System shows token count and skips if exceeded
-""")
+# Theme Options
+THEME_COLORS = {
+    "Light": {
+        "primary": "#000000",
+        "secondary": "#666666",
+        "accent": "#0066CC",
+        "background": "#FFFFFF"
+    },
+    "Dark": {
+        "primary": "#FFFFFF",
+        "secondary": "#CCCCCC",
+        "accent": "#3399FF",
+        "background": "#1E1E1E"
+    }
+}
 
+FONTS = ["Arial", "Calibri", "Times New Roman"]
+TRANSITIONS = ["None", "Fade", "Push", "Wipe", "Split"]
+
+# Helper Functions
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 def extract_text_from_pdf(pdf_bytes):
     all_text = ""
@@ -38,11 +73,9 @@ def extract_text_from_pdf(pdf_bytes):
                 all_text += text + "\n"
     return all_text
 
-
 def count_tokens(text):
     encoding = tiktoken.get_encoding("cl100k_base")
     return len(encoding.encode(text))
-
 
 def process_pdfs(uploaded_files):
     combined_text = ""
@@ -57,178 +90,197 @@ def process_pdfs(uploaded_files):
             tokens = count_tokens(text)
 
             if total_tokens + tokens > MAX_TOKENS:
-                st.warning(f"Skipping {file.name} - would exceed token limit. Current: {total_tokens:,}")
+                st.warning(f"Skipping {file.name} - would exceed token limit")
                 continue
 
             combined_text += f"\n\nSource: {file.name}\n{text}"
             total_tokens += tokens
             processed_files.append(file.name)
             st.success(f"Processed {file.name}: {tokens:,} tokens")
+            
         except Exception as e:
             st.error(f"Error processing {file.name}: {str(e)}")
     
-    st.write(f"Total tokens processed: {total_tokens:,}")
     return combined_text, total_tokens, processed_files
 
-
-def validate_ppt(uploaded_template):
-    """
-    Validates if the uploaded PowerPoint file is legitimate.
+def call_gemini_api_for_slides(source_text, topic, num_slides, selected_layout):
+    prompt = f"""
+    Create a {num_slides}-slide presentation about "{topic}" using {selected_layout} layout.
+    
+    For each slide provide:
+    1. title: Short, compelling title (max 8 words)
+    2. layout_type: One of {list(SLIDE_LAYOUTS.keys())}
+    3. content:
+       - For Title Slide: subtitle text
+       - For Content: 3-5 bullet points
+       - For Two Content: left and right bullet points
+       - For Section Header: subtitle
+       - For Comparison: comparison points in table format
+    4. transition: slide transition effect
+    
+    Output as JSON:
+    {{
+      "slides": [
+        {{
+          "title": "Title",
+          "layout_type": "Content",
+          "content": {{}},
+          "transition": "None"
+        }}
+      ]
+    }}
     """
     try:
-        Presentation(uploaded_template)
-        return True
-    except Exception:
-        return False
+        model = genai.GenerativeModel('gemini-1.5-pro')
+        response = model.generate_content(prompt)
+        content = response.text.strip()
+        
+        # Clean JSON response
+        if content.startswith("```") and content.endswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json\n"):
+                content = content[5:]
+            content = content.strip()
+        
+        return json.loads(content)
+    except Exception as e:
+        st.error(f"API Error: {str(e)}")
+        raise
 
-
-def extract_template_info(prs):
-    """
-    Extract layout and placeholder information from the PowerPoint template.
-    """
-    layout_info = []
-    for layout in prs.slide_layouts:
-        placeholders = []
-        for placeholder in layout.placeholders:
-            placeholders.append({
-                "name": placeholder.name,
-                "type": placeholder.placeholder_format.type,
-                "idx": placeholder.placeholder_format.idx,
-            })
-        layout_info.append({"layout": layout, "placeholders": placeholders})
-    return layout_info
-
-
-def apply_template_style(slide, slide_info, content):
-    """
-    Apply template styles (e.g., font, placeholder usage) to generated content.
-    """
-    if "title" in content and slide.shapes.title:
-        slide.shapes.title.text = content["title"]
+def apply_theme(slide, theme, layout_type):
+    colors = THEME_COLORS[theme["color_scheme"]]
+    primary_rgb = hex_to_rgb(colors["primary"])
+    secondary_rgb = hex_to_rgb(colors["secondary"])
+    accent_rgb = hex_to_rgb(colors["accent"])
     
-    for placeholder in slide.placeholders:
-        if placeholder.placeholder_format.type == 1:  # Body placeholder
-            text_frame = placeholder.text_frame
-            text_frame.text = ""  # Clear default text
-            for bullet in content.get("bullets", []):
-                p = text_frame.add_paragraph()
-                p.text = bullet
-                p.font.size = Pt(14)  # Adjust font size to match the template
-            break
+    # Apply to title
+    if slide.shapes.title:
+        title_frame = slide.shapes.title.text_frame
+        title_frame.paragraphs[0].font.name = theme["title_font"]
+        title_frame.paragraphs[0].font.size = Pt(32)
+        title_frame.paragraphs[0].font.color.rgb = RGBColor(*primary_rgb)
+    
+    # Apply to content
+    for shape in slide.shapes:
+        if shape.has_text_frame:
+            for paragraph in shape.text_frame.paragraphs:
+                paragraph.font.name = theme["body_font"]
+                paragraph.font.size = Pt(18)
+                paragraph.font.color.rgb = RGBColor(*secondary_rgb)
+    
+    # Add footer
+    if theme.get("footer_text"):
+        left = Inches(0.5)
+        top = slide.height - Inches(0.5)
+        width = slide.width - Inches(1)
+        height = Inches(0.3)
+        footer = slide.shapes.add_textbox(left, top, width, height)
+        footer.text = theme["footer_text"]
+        footer.text_frame.paragraphs[0].font.size = Pt(10)
+        footer.text_frame.paragraphs[0].font.color.rgb = RGBColor(*secondary_rgb)
 
-
-def create_ppt_from_template(slides_data, template_ppt, num_slides_required):
-    """
-    Generate a PowerPoint presentation based on the provided template.
-    Adjusts the number of slides to match the required count.
-    """
+def create_enhanced_ppt(slides_data, template_ppt, theme, num_slides):
     prs = Presentation(template_ppt)
-    layout_info = extract_template_info(prs)
     
-    # Remove redundant slides
-    while len(prs.slides) > num_slides_required:
-        slide_to_remove = prs.slides[len(prs.slides) - 1]
-        prs.slides._sldIdLst.remove(slide_to_remove._element)
-
-    # Duplicate slides if more are needed
-    while len(prs.slides) < num_slides_required:
-        prs.slides.add_slide(prs.slides[0].slide_layout)
-
-    for idx, slide_info in enumerate(slides_data["slides"]):
-        if idx < len(prs.slides):
-            slide = prs.slides[idx]
-        else:
-            layout = next(
-                (li["layout"] for li in layout_info if len(li["placeholders"]) > 1),
-                prs.slide_layouts[0]
-            )
-            slide = prs.slides.add_slide(layout)
-        apply_template_style(slide, layout_info, slide_info)
+    for slide_info in slides_data["slides"]:
+        layout_type = slide_info["layout_type"]
+        layout_idx = SLIDE_LAYOUTS[layout_type]["id"]
+        slide = prs.slides.add_slide(prs.slide_layouts[layout_idx])
+        
+        # Apply content
+        slide.shapes.title.text = slide_info["title"]
+        
+        if layout_type == "Content":
+            body_shape = slide.placeholders[1]
+            tf = body_shape.text_frame
+            tf.text = ""
+            for bullet in slide_info["content"].get("bullets", []):
+                p = tf.add_paragraph()
+                p.text = bullet
+                p.level = 0
+        
+        elif layout_type == "Two Content":
+            left_shape = slide.placeholders[1]
+            right_shape = slide.placeholders[2]
+            
+            for shape, content in [(left_shape, slide_info["content"].get("left", [])),
+                                   (right_shape, slide_info["content"].get("right", []))]:
+                tf = shape.text_frame
+                tf.text = ""
+                for bullet in content:
+                    p = tf.add_paragraph()
+                    p.text = bullet
+                    p.level = 0
+        
+        # Apply theme and transitions
+        apply_theme(slide, theme, layout_type)
+        if slide_info.get("transition") != "None":
+            slide.transition = slide_info["transition"]
     
     pptx_stream = BytesIO()
     prs.save(pptx_stream)
     pptx_stream.seek(0)
     return pptx_stream
 
+# UI Setup
+st.set_page_config(page_title="Enhanced PPT Generator", layout="wide")
+st.title("AI-Powered PPT Generator with Custom Theme")
 
-def call_gemini_api_for_slides(source_text, topic, num_slides):
-    """
-    Generates slides content using the Gemini API.
-    """
-    prompt = f"""
-    Create a {num_slides}-slide presentation about "{topic}".
-    For each slide provide:
-    - Short title (max 8 words)
-    - 3-5 bullet points
-    Output as JSON only:
-    {{
-      "slides": [
-        {{"title": "Title", "bullets": ["Point 1", "Point 2", "Point 3"]}}
-      ]
-    }}
-    Source text: {source_text}
-    """
-    try:
-        model = genai.GenerativeModel('gemini-1.5-pro')
-        response = model.generate_content(
-            prompt,
-            generation_config={
-                "temperature": 0.2,
-                "top_p": 1,
-                "top_k": 32,
-                "max_output_tokens": 2048,
-            }
-        )
-        content = response.text.strip()
-        if content.startswith("```") and content.endswith("```"):
-            content = content.split("```")[1]
-            if content.startswith("json\n"):
-                content = content[5:]
-            content = content.strip()
-        return json.loads(content)
-    except Exception as e:
-        st.error(f"API Error: {str(e)}")
-        raise
+# Sidebar for theme customization
+with st.sidebar:
+    st.header("Presentation Settings")
+    
+    # Theme Selection
+    theme = {
+        "color_scheme": st.selectbox("Color Scheme", list(THEME_COLORS.keys())),
+        "title_font": st.selectbox("Title Font", FONTS),
+        "body_font": st.selectbox("Body Font", FONTS),
+        "transition": st.selectbox("Default Transition", TRANSITIONS),
+        "footer_text": st.text_input("Footer Text (optional)")
+    }
+    
+    # Layout Preview
+    st.header("Layout Preview")
+    selected_layout = st.selectbox("Select Layout", list(SLIDE_LAYOUTS.keys()))
+    st.markdown(f"**Placeholders:** {', '.join(SLIDE_LAYOUTS[selected_layout]['placeholders'])}")
 
-
-# UI Inputs
+# Main content
 uploaded_files = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
 uploaded_template = st.file_uploader("Upload PPT template (optional)", type=["pptx"])
 topic = st.text_input("Presentation topic:")
 num_slides = st.number_input("Number of slides:", 1, 50, 10)
-generate_button = st.button("Generate PPT")
 
-# Main execution
-if generate_button:
-    if not uploaded_files:
-        st.error("Please upload at least one PDF")
-    elif not topic:
-        st.error("Please enter a topic")
-    elif uploaded_template and not validate_ppt(uploaded_template):
-        st.error("Uploaded template is not a valid PowerPoint file.")
-    else:
-        try:
-            with st.spinner("Processing PDFs..."):
-                source_text, total_tokens, processed_files = process_pdfs(uploaded_files)
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button("Generate Presentation"):
+        if not topic.strip():
+            st.error("Please enter a topic.")
+        elif not uploaded_files:
+            st.error("Please upload at least one PDF.")
+        else:
+            # Process PDFs
+            combined_text, total_tokens, processed_files = process_pdfs(uploaded_files)
+            if not processed_files:
+                st.warning("No files processed. Please check your input.")
+            else:
+                # Call the API
+                slides_data = call_gemini_api_for_slides(combined_text, topic, num_slides, selected_layout)
                 
-                if total_tokens == 0:
-                    st.error("No content could be processed.")
+                # Use provided template or default one
+                if uploaded_template is None:
+                    create_default_template()
+                    template_ppt = "template.pptx"
                 else:
-                    slides_data = call_gemini_api_for_slides(source_text, topic, num_slides)
-                    if uploaded_template:
-                        template_bytes = uploaded_template.getvalue()
-                        template_ppt = BytesIO(template_bytes)
-                    else:
-                        st.error("No valid template uploaded.")
-                        raise Exception("No template available.")
-
-                    ppt_file = create_ppt_from_template(slides_data, template_ppt, num_slides)
-                    st.success("✅ Presentation generated!")
-                    st.download_button(
-                        "⬇️ Download PPT",
-                        ppt_file,
-                        file_name="presentation.pptx",
-                        mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
-                    )
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
+                    template_ppt = uploaded_template
+                
+                # Create the PPT
+                pptx_stream = create_enhanced_ppt(slides_data, template_ppt, theme, num_slides)
+                st.success("Presentation generated successfully!")
+                st.download_button(
+                    label="Download PPTX",
+                    data=pptx_stream,
+                    file_name="presentation.pptx",
+                    mime="application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                )
+```
